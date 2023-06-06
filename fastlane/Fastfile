@@ -1,0 +1,263 @@
+default_platform :ios
+
+require 'json'
+require 'net/http'
+require 'xcodeproj'
+import 'Sonarfile'
+import 'Allurefile'
+
+# The number of times the stress test suite is ran
+stress_tests_cycles = 50
+
+before_all do
+  if is_ci
+    setup_ci()
+  end
+end
+
+desc "Release a new version"
+lane :release do |options|
+  ensure_git_branch(branch: 'main') # We can only release on default branch
+  ensure_git_status_clean unless options[:no_ensure_clean]
+
+  UI.user_error!("Please set GITHUB_TOKEN environment value. See https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token") unless !ENV["GITHUB_TOKEN"].nil?
+
+  if (!options[:version].nil?) # User passed a version, use it
+    version_number = options.fetch(:version)
+    increment_version_number_in_plist(version_number: version_number, xcodeproj: "StreamChatSwiftUI.xcodeproj", target: "StreamChatSwiftUI")
+  else
+    UI.user_error!("Please use type parameter with one of the options: type:patch, type:minor, type:major") unless ["patch", "minor", "major"].include?(options[:type])
+    version_number = increment_version_number_in_plist(bump_type: options[:type], xcodeproj: "StreamChatSwiftUI.xcodeproj", target: "StreamChatSwiftUI")
+  end
+
+  if git_tag_exists(tag: version_number)
+    UI.user_error!("Tag for version #{version_number} already exists!")
+  end
+
+  changes = touch_changelog(release_version: version_number)
+
+   # Make sure the podspecs actually build before pushing
+  pod_lib_lint(podspec: "StreamChatSwiftUI.podspec", allow_warnings: true)
+
+  version_bump_podspec(path: "StreamChatSwiftUI.podspec", version_number: version_number)
+
+  sh("git add -A")
+
+  if(!prompt(text: "Will commit changes. All looking good?", boolean: true))
+    UI.user_error!("Not committing changes")
+  end
+
+  sh("git commit -m 'Bump #{version_number}'")
+  sh("git tag #{version_number}")
+
+  if(!prompt(text: "Will push changes. All looking good?", boolean: true))
+    UI.user_error!("Not pushing changes")
+  end
+
+  push_to_git_remote(tags: true)
+
+  github_release = set_github_release(
+                     repository_name: "GetStream/stream-chat-swiftui",
+                     api_token: ENV["GITHUB_TOKEN"],
+                     name: version_number,
+                     tag_name: version_number,
+                     description: changes
+                   )
+
+  # The & operator makes sure truthy values are converted to bool true
+  # and falsy (false and nil) values are converted to bool false
+  push_pods(sync: options[:sync] & true)
+
+  UI.success("Successfully released #{version_number}")
+  UI.success("Github release was created, please visit #{github_release["url"]} to see it")
+end
+
+desc "Pushes the StreamChatSwiftUI SDK podspec to Cocoapods trunk"
+lane :push_pods do |options|
+  # First pod release will not have any problems
+  pod_push(path: "StreamChatSwiftUI.podspec", allow_warnings: true)
+end
+
+desc "If `readonly: true` (by default), installs all Certs and Profiles necessary for development and ad-hoc.\nIf `readonly: false`, recreates all Profiles necessary for development and ad-hoc, updates them locally and remotely."
+lane :match_me do |options|
+  # Get `:readonly` value, fallback to `true` if it's missing.
+  readonly = options.fetch(:readonly) { true }
+
+  ["development", "adhoc", "appstore"].each do |type|
+    match(
+      type: type,
+      app_identifier: [
+        "io.getstream.iOS.DemoAppSwiftUI"
+      ],
+      readonly: readonly,
+      force_for_new_devices: !is_ci
+    )
+  end
+end
+
+desc "Register new device, regenerates profiles, updates them remotely and locally"
+lane :register_new_device_and_recreate_profiles do
+  device_name = prompt(text: "Enter the device name: ")
+  device_udid = prompt(text: "Enter the device UDID: ")
+
+  register_device(
+    name: device_name,
+    udid: device_udid
+  )
+
+  match_me(readonly: false)
+end
+
+desc "Get next PR number from github to be used in CHANGELOG"
+lane :get_next_issue_number do
+  result = github_api(api_token: ENV["FASTLANE_GITHUB_TOKEN"], path: "/repos/GetStream/stream-chat-swift/issues")
+
+  next_issue_number = result[:json][0]["number"] + 1
+  next_issue_link = "[##{next_issue_number}](https://github.com/GetStream/stream-chat-swift/issues/#{next_issue_number})"
+
+  clipboard(value: next_issue_link)
+
+  UI.success "The next PR / Issue will have number: #{next_issue_number}"
+  UI.success "So the next markdown link is: #{next_issue_link}"
+  UI.success "Next markdown link is copied to your clipboard! ⬆️"
+end
+
+# Adds "CI=TRUE" environment variable to the provided test plan file
+def add_ci_env_var_to(test_plan_file)
+  return unless is_ci
+
+  data_hash = JSON.parse(File.read(test_plan_file))
+
+  # Create the `environmentVariableEntries` array if it doesn't exist
+  data_hash['defaultOptions']['environmentVariableEntries'] ||= []
+
+  # Append the `CI` ENV variable
+  data_hash['defaultOptions']['environmentVariableEntries'] << { 'key' => 'CI', 'value' => 'TRUE' }
+  File.write(test_plan_file, JSON.pretty_generate(data_hash))
+
+  UI.success("✅ `CI=TRUE` ENV variable added to #{test_plan_file}")
+  UI.message("Current testplan ENV variables:\n#{data_hash['defaultOptions']['environmentVariableEntries']}")
+end
+
+desc "Runs tests in Debug config"
+lane :test_ui do |options|
+  next unless testing_required?(:ui)
+
+  add_ci_env_var_to('../StreamChatSwiftUITests/Tests/StreamChatSwiftUI.xctestplan')
+
+  scan(
+    project: "StreamChatSwiftUI.xcodeproj",
+    scheme: "StreamChatSwiftUI",
+    testplan: "StreamChatSwiftUI",
+    configuration: "Debug",
+    clean: true,
+    devices: options[:device],
+    build_for_testing: options[:build_for_testing]
+  )
+end
+
+desc "Runs e2e ui tests using mock server in Debug config"
+lane :test_e2e_mock do |options|
+  next unless testing_required?(:e2e)
+
+  add_ci_env_var_to('../StreamChatSwiftUITestsAppTests/StreamChatSwiftUITestsApp.xctestplan')
+
+  scan_options = {
+    project: 'StreamChatSwiftUI.xcodeproj',
+    scheme: 'StreamChatSwiftUITestsApp',
+    testplan: 'StreamChatSwiftUITestsApp',
+    configuration: 'Debug',
+    devices: options[:device],
+    number_of_retries: 1
+  }
+  scan(scan_options.merge(clean: true, build_for_testing: is_ci))
+
+  if is_ci
+    parallelize_tests_on_ci(
+      scan: scan_options,
+      derived_data: lane_context[SharedValues::SCAN_DERIVED_DATA_PATH],
+      batch: options[:batch]
+    )
+  end
+end
+
+private_lane :parallelize_tests_on_ci do |options|
+  xctestrun = Dir.glob("#{options[:derived_data]}/Build/Products/*.xctestrun").first
+  tests = retrieve_tests(xctestrun: xctestrun).values.flatten
+  slice_size = (tests.size / ENV['MATRIX_SIZE'].to_f).ceil
+  only_testing = []
+  tests.each_slice(slice_size) { |test| only_testing << test }
+  only_testing_batch = only_testing[options[:batch].to_i]
+
+  UI.success("Tests in total: #{only_testing.flatten.size}. Running #{only_testing_batch.size} of them ⌛️")
+  scan(
+    options[:scan].merge(
+      test_without_building: true,
+      derived_data_path: options[:derived_data],
+      only_testing: only_testing_batch
+    )
+  )
+end
+
+desc "Builds Demo app"
+lane :build_demo do |options|
+  build_example_app("DemoAppSwiftUI", options)
+end
+
+def build_example_app(scheme, options)
+  scan(
+    project: "StreamChatSwiftUI.xcodeproj",
+    scheme: scheme,
+    clean: true,
+    build_for_testing: true,
+    devices: options[:device],
+  )
+end
+
+desc "Test SPM Integration"
+lane :spm_integration do |options|
+  build_app(
+    project: "Integration/SPM/SwiftPackageManager.xcodeproj",
+    scheme: "SwiftPackageManager",
+    skip_package_ipa: true,
+    skip_archive: true,
+    destination: "generic/platform=iOS Simulator"
+  )
+end
+
+desc "Test CocoaPods Integration"
+lane :cocoapods_integration do
+
+  cocoapods(
+    clean_install: true,
+    podfile: "Integration/CocoaPods/"
+  )
+
+  build_app(
+    workspace: "Integration/CocoaPods/CocoaPods.xcworkspace",
+    scheme: "CocoaPods",
+    skip_package_ipa: true,
+    skip_archive: true,
+    clean: true,
+    destination: "generic/platform=iOS Simulator"
+  )
+end
+
+def testing_required?(type)
+  return true if ENV['GITHUB_EVENT_NAME'] != 'pull_request'
+
+  sources = {
+    e2e: %w[Sources StreamChatSwiftUITestsAppTests StreamChatSwiftUITestsApp],
+    ui: %w[Sources StreamChatSwiftUITests StreamChatSwiftUI.xcodeproj]
+  }
+
+  pr_number = JSON.parse(ENV['GITHUB_EVENT'])['pull_request']['number']
+
+  changed_files = sh("gh pr view #{pr_number} --json files -q '.files[].path'")
+
+  changed_files = changed_files.split("\n").select do |path|
+    sources[type.to_sym].any? { |required| path.start_with?(required) }
+  end
+
+  changed_files.size.positive?
+end
